@@ -26,15 +26,6 @@ from .pipeline import (
 
 )
 
-from .workio import (
-    open,
-    save,
-    current_file,
-    has_unsaved_changes,
-    file_extensions,
-    work_root
-)
-
 from .lib import (
     export_alembic,
     lsattr,

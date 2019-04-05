@@ -6,8 +6,24 @@ import shutil
 
 
 from ...vendor.Qt import QtWidgets, QtCore
-from ... import style, io, api
+from ... import style, io, api, pipeline
 from .. import lib as parentlib
+
+
+def current_host():
+    """Return the compatible current host as implemented in host.py"""
+
+    from . import host
+
+    for Host in pipeline.plugin_from_module(superclass=host.Host,
+                                            module=host):
+        if Host.compatible():
+            return Host()
+
+    raise ValueError(
+        "Could not determine Work Files host in executable:"
+        " \"{0}\"".format(sys.executable)
+    )
 
 
 class NameWindow(QtWidgets.QDialog):
@@ -129,7 +145,7 @@ class NameWindow(QtWidgets.QDialog):
             _, extension = os.path.splitext(current_file)
         else:
             # Fall back to the first extension supported for this host.
-            extension = self.host.file_extensions()[0]
+            extension = self.host.extensions()[0]
 
         work_file = work_file + extension
 
@@ -143,7 +159,7 @@ class NameWindow(QtWidgets.QDialog):
             files = os.listdir(self.root)
 
             # Fast match on extension
-            extensions = self.host.file_extensions()
+            extensions = self.host.extensions()
             files = [f for f in files if os.path.splitext(f)[1] in extensions]
 
             # Build template without optionals, version to digits only regex
@@ -195,7 +211,7 @@ class NameWindow(QtWidgets.QDialog):
 
     def setup(self, root):
         self.root = root
-        self.host = api.registered_host()
+        self.host = current_host()
 
         # Get work file name
         self.data = {
@@ -232,7 +248,7 @@ class Window(QtWidgets.QDialog):
         if self.root is None:
             self.root = os.getcwd()
 
-        self.host = api.registered_host()
+        self.host = current_host()
 
         self.layout = QtWidgets.QVBoxLayout()
         self.setLayout(self.layout)
@@ -269,12 +285,9 @@ class Window(QtWidgets.QDialog):
         separator.setFrameShadow(QtWidgets.QFrame.Sunken)
         self.layout.addWidget(separator)
 
-        current_file = self.host.current_file()
-        if current_file:
-            current_label = os.path.basename(current_file)
-        else:
-            current_label = "<unsaved>"
-        current_file_label = QtWidgets.QLabel("Current File: " + current_label)
+        current_file_label = QtWidgets.QLabel(
+            "Current File: " + (self.host.current_file() or "<unsaved>")
+        )
         self.layout.addWidget(current_file_label)
 
         buttons_layout = QtWidgets.QHBoxLayout()
@@ -305,7 +318,7 @@ class Window(QtWidgets.QDialog):
         self.list.clear()
 
         modified = []
-        extensions = set(self.host.file_extensions())
+        extensions = set(self.host.extensions())
         for f in sorted(os.listdir(self.root)):
             path = os.path.join(self.root, f)
             if os.path.isdir(path):
@@ -403,7 +416,7 @@ class Window(QtWidgets.QDialog):
 
     def on_browse_pressed(self):
 
-        filter = " *".join(self.host.file_extensions())
+        filter = " *".join(self.host.extensions())
         filter = "Work File (*{0})".format(filter)
         work_file = QtWidgets.QFileDialog.getOpenFileName(
             caption="Work Files",
@@ -434,23 +447,10 @@ class Window(QtWidgets.QDialog):
 def show(root=None):
     """Show Work Files GUI"""
 
-    host = api.registered_host()
-    if host is None:
-        raise RuntimeError("No registered host.")
-
-    # Verify the host has implemented the api for Work Files
-    required = ["open", "save", "current_file", "work_root"]
-    missing = []
-    for name in required:
-        if not hasattr(host, name):
-            missing.append(name)
-    if missing:
-        raise RuntimeError("Host is missing required Work Files interfaces: "
-                           "%s (host: %s)" % (", ".join(missing), host))
-
     # Allow to use a Host's default root.
     if root is None:
-        root = host.work_root()
+        host = current_host()
+        root = host.root()
         if not root:
             raise ValueError("Root not given and no root returned by "
                              "default from current host %s" % host.__name__)
