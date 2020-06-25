@@ -76,7 +76,13 @@ def install(host):
 
     # Optional host install function
     if hasattr(host, "install"):
-        host.install(config)
+        host.install()
+
+    # Optional config.host.install()
+    host_name = host.__name__.rsplit(".", 1)[-1]
+    config_host = lib.find_submodule(config, host_name)
+    if hasattr(config_host, "install"):
+        config_host.install()
 
     register_host(host)
     register_config(config)
@@ -104,9 +110,16 @@ def find_config():
 def uninstall():
     """Undo all of what `install()` did"""
     config = registered_config()
+    host = registered_host()
+
+    # Optional config.host.uninstall()
+    host_name = host.__name__.rsplit(".", 1)[-1]
+    config_host = lib.find_submodule(config, host_name)
+    if hasattr(config_host, "uninstall"):
+        config_host.uninstall()
 
     try:
-        registered_host().uninstall(config)
+        host.uninstall()
     except AttributeError:
         pass
 
@@ -159,18 +172,8 @@ class Loader(list):
     order = 0
 
     def __init__(self, context):
-        template = context["project"]["config"]["template"]["publish"]
-
-        data = {
-            key: value["name"]
-            for key, value in context.items()
-        }
-
-        data["root"] = registered_root()
-        data["silo"] = context["asset"]["silo"]
-
-        fname = template.format(**data)
-        self.fname = fname
+        representation = context['representation']
+        self.fname = get_representation_path(representation)
 
     def load(self, context, name=None, namespace=None, options=None):
         """Load asset via database
@@ -333,7 +336,6 @@ class Application(Action):
     def is_compatible(self, session):
         required = ["AVALON_PROJECTS",
                     "AVALON_PROJECT",
-                    "AVALON_SILO",
                     "AVALON_ASSET",
                     "AVALON_TASK"]
         missing = [x for x in required if x not in session]
@@ -353,7 +355,7 @@ class Application(Action):
         project = io.find_one({"type": "project"})
         template = project["config"]["template"]["work"]
         workdir = _format_work_template(template, session)
-        session["AVALON_WORKDIR"] = workdir
+        session["AVALON_WORKDIR"] = os.path.normpath(workdir)
 
         # Construct application environment from .toml config
         app_environment = self.config.get("environment", {})
@@ -718,7 +720,10 @@ def _validate_signature(module, signatures):
 
         else:
             attr = getattr(module, member)
-            signature = inspect.getargspec(attr)[0]
+            if sys.version_info.major >= 3:
+                signature = inspect.getfullargspec(attr)[0]
+            else:
+                signature = inspect.getargspec(attr)[0]
             required_signature = signatures[member]
 
             assert isinstance(signature, list)
@@ -830,7 +835,13 @@ def debug_host():
             yield container
 
     host.__dict__.update({
-        "ls": ls
+        "ls": ls,
+        "open_file": lambda fname: None,
+        "save_file": lambda fname: None,
+        "current_file": lambda: os.path.expanduser("~/temp.txt"),
+        "has_unsaved_changes": lambda: False,
+        "work_root": lambda: os.path.expanduser("~/temp"),
+        "file_extensions": lambda: ["txt"],
     })
 
     return host
@@ -886,7 +897,6 @@ def create(name, asset, family, options=None, data=None):
         except Exception as e:
             log.warning(e)
             continue
-
         plugins.append(plugin)
 
     assert plugins, "No Creator plug-ins were run, this is a bug"
@@ -928,6 +938,81 @@ def get_representation_context(representation):
     return context
 
 
+def compute_session_changes(session, task=None, asset=None, app=None):
+    """Compute the changes for a Session object on asset, task or app switch
+
+    This does *NOT* update the Session object, but returns the changes
+    required for a valid update of the Session.
+
+    Args:
+        session (dict): The initial session to compute changes to.
+            This is required for computing the full Work Directory, as that
+            also depends on the values that haven't changed.
+        task (str, Optional): Name of task to switch to.
+        asset (str or dict, Optional): Name of asset to switch to.
+            You can also directly provide the Asset dictionary as returned
+            from the database to avoid an additional query. (optimization)
+        app (str, Optional): Name of app to switch to.
+
+    Returns:
+        dict: The required changes in the Session dictionary.
+
+    """
+
+    changes = dict()
+
+    # If no changes, return directly
+    if not any([task, asset, app]):
+        return changes
+
+    # Get asset document and asset
+    asset_document = None
+    if asset:
+        if isinstance(asset, dict):
+            # Assume asset database document
+            asset_document = asset
+            asset = asset["name"]
+        else:
+            # Assume asset name
+            asset_document = io.find_one({"name": asset,
+                                          "type": "asset"})
+            assert asset_document, "Asset must exist"
+
+    # Detect any changes compared session
+    mapping = {
+        "AVALON_ASSET": asset,
+        "AVALON_TASK": task,
+        "AVALON_APP": app,
+    }
+    changes = {key: value for key, value in mapping.items()
+               if value and value != session.get(key)}
+    if not changes:
+        return changes
+
+    # Update silo and hierarchy when asset changed
+    if "AVALON_ASSET" in changes:
+
+        # Update silo
+        changes["AVALON_SILO"] = asset_document.get("silo")
+
+        # Update hierarchy
+        parents = asset_document['data'].get('parents', [])
+        hierarchy = ""
+        if len(parents) > 0:
+            hierarchy = os.path.sep.join(parents)
+        changes['AVALON_HIERARCHY'] = hierarchy
+
+    # Compute work directory (with the temporary changed session so far)
+    project = io.find_one({"type": "project"},
+                          projection={"config.template.work": True})
+    template = project["config"]["template"]["work"]
+    _session = session.copy()
+    _session.update(changes)
+    changes["AVALON_WORKDIR"] = _format_work_template(template, _session)
+
+    return changes
+
+
 def update_current_task(task=None, asset=None, app=None):
     """Update active Session to a new task work area.
 
@@ -943,41 +1028,24 @@ def update_current_task(task=None, asset=None, app=None):
 
     """
 
-    mapping = {
-        "AVALON_ASSET": asset,
-        "AVALON_TASK": task,
-        "AVALON_APP": app,
-    }
-    changed = {key: value for key, value in mapping.items() if value}
-    if not changed:
-        return
+    changes = compute_session_changes(Session,
+                                      task=task,
+                                      asset=asset,
+                                      app=app)
 
-    # Update silo when asset changed
-    if "AVALON_ASSET" in changed:
-        asset_document = io.find_one({"name": changed["AVALON_ASSET"],
-                                      "type": "asset"},
-                                     projection={"silo": True})
-        assert asset_document, "Asset must exist"
-        changed["AVALON_SILO"] = asset_document["silo"]
-
-    # Compute work directory (with the temporary changed session so far)
-    project = io.find_one({"type": "project"},
-                          projection={"config.template.work": True})
-    template = project["config"]["template"]["work"]
-    _session = Session.copy()
-    _session.update(changed)
-    changed["AVALON_WORKDIR"] = _format_work_template(template, _session)
-
-    # Update the full session in one go to avoid half updates
-    Session.update(changed)
-
-    # Update the environment
-    os.environ.update(changed)
+    # Update the Session and environments. Pop from environments all keys with
+    # value set to None.
+    for key, value in changes.items():
+        Session[key] = value
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
     # Emit session change
-    emit("taskChanged", changed.copy())
+    emit("taskChanged", changes.copy())
 
-    return changed
+    return changes
 
 
 def _format_work_template(template, session=None):
@@ -1002,11 +1070,14 @@ def _format_work_template(template, session=None):
     return template.format(**{
         "root": registered_root(),
         "project": session["AVALON_PROJECT"],
-        "silo": session["AVALON_SILO"],
         "asset": session["AVALON_ASSET"],
         "task": session["AVALON_TASK"],
         "app": session["AVALON_APP"],
-        "user": session.get("AVALON_USER", getpass.getuser())
+
+        # Optional
+        "silo": session.get("AVALON_SILO"),
+        "user": session.get("AVALON_USER", getpass.getuser()),
+        "hierarchy": session.get("AVALON_HIERARCHY"),
     })
 
 
@@ -1190,6 +1261,13 @@ def switch(container, representation):
 def get_representation_path(representation):
     """Get filename from representation document
 
+    There are three ways of getting the path from representation which are
+    tried in following sequence until successful.
+    1. Get template from representation['data']['template'] and data from
+       representation['context']. Then format template with the data.
+    2. Get template from project['config'] and format it with default data set
+    3. Get representation['data']['path'] and use it directly
+
     Args:
         representation(dict): representation document from the database
 
@@ -1198,20 +1276,80 @@ def get_representation_path(representation):
 
     """
 
-    version_, subset, asset, project = io.parenthood(representation)
-    template_publish = project["config"]["template"]["publish"]
-    return template_publish.format(**{
-        "root": registered_root(),
-        "project": project["name"],
-        "asset": asset["name"],
-        "silo": asset["silo"],
-        "subset": subset["name"],
-        "version": version_["name"],
-        "representation": representation["name"],
-        "user": Session.get("AVALON_USER", getpass.getuser()),
-        "app": Session.get("AVALON_APP", ""),
-        "task": Session.get("AVALON_TASK", "")
-    })
+    def path_from_represenation():
+        try:
+            template = representation["data"]["template"]
+
+        except KeyError:
+            return None
+
+        try:
+            context = representation["context"]
+            context["root"] = registered_root()
+            path = template.format(**context)
+
+        except KeyError:
+            # Template references unavailable data
+            return None
+
+        if os.path.exists(path):
+            return os.path.normpath(path)
+
+    def path_from_config():
+        try:
+            version_, subset, asset, project = io.parenthood(representation)
+        except ValueError:
+            log.debug(
+                "Representation %s wasn't found in database, "
+                "like a bug" % representation["name"]
+            )
+            return None
+
+        try:
+            template = project["config"]["template"]["publish"]
+        except KeyError:
+            log.debug(
+                "No template in project %s, "
+                "likely a bug" % project["name"]
+            )
+            return None
+
+        # Cannot fail, required members only
+        data = {
+            "root": registered_root(),
+            "project": project["name"],
+            "asset": asset["name"],
+            "silo": asset.get("silo"),
+            "subset": subset["name"],
+            "version": version_["name"],
+            "representation": representation["name"],
+            "user": Session.get("AVALON_USER", getpass.getuser()),
+            "app": Session.get("AVALON_APP", ""),
+            "task": Session.get("AVALON_TASK", "")
+        }
+
+        try:
+            path = template.format(**data)
+        except KeyError as e:
+            log.debug("Template references unavailable data: %s" % e)
+            return None
+
+        if os.path.exists(path):
+            return os.path.normpath(path)
+
+    def path_from_data():
+        if "path" not in representation["data"]:
+            return None
+
+        path = representation["data"]["path"]
+        if os.path.exists(path):
+            return os.path.normpath(path)
+
+    return (
+        path_from_represenation() or
+        path_from_config() or
+        path_from_data()
+    )
 
 
 def is_compatible_loader(Loader, context):
@@ -1224,7 +1362,11 @@ def is_compatible_loader(Loader, context):
         bool
 
     """
-    families = context["version"]["data"]["families"]
+    if context["subset"]["schema"] == "avalon-core:subset-3.0":
+        families = context["subset"]["data"]["families"]
+    else:
+        families = context["version"]["data"].get("families", [])
+
     representation = context["representation"]
     has_family = ("*" in Loader.families or
                   any(family in Loader.families for family in families))

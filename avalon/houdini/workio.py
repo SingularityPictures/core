@@ -12,7 +12,7 @@ def has_unsaved_changes():
     return hou.hipFile.hasUnsavedChanges()
 
 
-def save(filepath):
+def save_file(filepath):
 
     # Force forwards slashes to avoid segfault
     filepath = filepath.replace("\\", "/")
@@ -23,7 +23,7 @@ def save(filepath):
     return filepath
 
 
-def open(filepath):
+def open_file(filepath):
 
     # Force forwards slashes to avoid segfault
     filepath = filepath.replace("\\", "/")
@@ -48,11 +48,10 @@ def current_file():
     return current_filepath
 
 
-def work_root():
-    from avalon import api
+def work_root(session):
 
-    work_dir = api.Session["AVALON_WORKDIR"]
-    scene_dir = api.Session.get("AVALON_SCENEDIR")
+    work_dir = session["AVALON_WORKDIR"]
+    scene_dir = session.get("AVALON_SCENEDIR")
     if scene_dir:
         return os.path.join(work_dir, scene_dir)
     else:

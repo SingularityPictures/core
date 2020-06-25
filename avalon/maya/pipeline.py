@@ -5,11 +5,13 @@ import importlib
 import contextlib
 
 from maya import cmds, OpenMaya
+import maya.utils
+import maya.api.OpenMaya as om
 from pyblish import api as pyblish
 
 from . import lib, compat
-from ..lib import logger
-from .. import api, schema
+from ..lib import logger, find_submodule
+from .. import api
 from ..tools import workfiles
 from ..vendor.Qt import QtCore, QtWidgets
 
@@ -31,7 +33,7 @@ AVALON_CONTAINERS = ":AVALON_CONTAINERS"
 IS_HEADLESS = not hasattr(cmds, "about") or cmds.about(batch=True)
 
 
-def install(config):
+def install():
     """Install Maya-specific functionality of avalon-core.
 
     This function is called automatically on calling `api.install(maya)`.
@@ -56,10 +58,6 @@ def install(config):
     pyblish.register_host("mayapy")
     pyblish.register_host("maya")
 
-    config = find_host_config(config)
-    if hasattr(config, "install"):
-        config.install()
-
 
 def _set_project():
     """Sets the maya project to the current Session's work directory.
@@ -82,26 +80,22 @@ def _set_project():
     cmds.workspace(workdir, openWorkspace=True)
 
 
-def find_host_config(config):
-    try:
-        config = importlib.import_module(config.__name__ + ".maya")
-    except ImportError as exc:
-        if str(exc) != "No module name {}".format(config.__name__ + ".maya"):
-            raise
-        config = None
+def get_main_window():
+    """Acquire Maya's main window"""
+    if self._parent is None:
+        self._parent = {
+            widget.objectName(): widget
+            for widget in QtWidgets.QApplication.topLevelWidgets()
+        }["MayaWindow"]
+    return self._parent
 
-    return config
 
-
-def uninstall(config):
+def uninstall():
     """Uninstall Maya-specific functionality of avalon-core.
 
     This function is called automatically on calling `api.uninstall()`.
 
     """
-    config = find_host_config(config)
-    if hasattr(config, "uninstall"):
-        config.uninstall()
 
     _uninstall_menu()
 
@@ -112,12 +106,11 @@ def uninstall(config):
 
 def _install_menu():
     from ..tools import (
+        projectmanager,
         creator,
         loader,
         publish,
-        cbloader,
-        cbsceneinventory,
-        contextmanager
+        sceneinventory
     )
 
     from . import interactive
@@ -131,19 +124,17 @@ def _install_menu():
                   parent="MayaWindow")
 
         # Create context menu
-        context_label = "{}, {}".format(api.Session["AVALON_ASSET"],
-                                        api.Session["AVALON_TASK"])
-        context_menu = cmds.menuItem("currentContext",
-                                     label=context_label,
-                                     parent=self._menu,
-                                     subMenu=True)
+        context_label = "{}, {}".format(
+            api.Session["AVALON_ASSET"],
+            api.Session["AVALON_TASK"]
+        )
 
-        cmds.menuItem("setCurrentContext",
-                      label="Set Context",
-                      parent=context_menu,
-                      command=lambda *args: contextmanager.show(
-                          parent=self._parent
-                      ))
+        cmds.menuItem(
+            "currentContext",
+            label=context_label,
+            parent=self._menu,
+            enable=False
+        )
 
         cmds.setParent("..", menu=True)
 
@@ -153,37 +144,40 @@ def _install_menu():
         cmds.menuItem("Create...",
                       command=lambda *args: creator.show(parent=self._parent))
 
-        if api.Session.get("AVALON_EARLY_ADOPTER"):
-            cmds.menuItem("Load...",
-                          command=lambda *args:
-                          cbloader.show(parent=self._parent,
-                                        use_context=True))
-        else:
-            cmds.menuItem("Load...",
-                          command=lambda *args:
-                          loader.show(parent=self._parent))
+        cmds.menuItem("Load...",
+                      command=lambda *args: loader.show(parent=self._parent,
+                                                        use_context=True))
 
         cmds.menuItem("Publish...",
                       command=lambda *args: publish.show(parent=self._parent),
                       image=publish.ICON)
 
         cmds.menuItem("Manage...",
-                      command=lambda *args: cbsceneinventory.show(
+                      command=lambda *args: sceneinventory.show(
                           parent=self._parent))
 
         cmds.menuItem(divider=True)
 
         cmds.menuItem("Work Files", command=launch_workfiles_app)
 
-        cmds.menuItem("System",
-                      label="System",
-                      tearOff=True,
+        system = cmds.menuItem("System",
+                               label="System",
+                               tearOff=True,
+                               subMenu=True,
+                               parent=self._menu)
+
+        cmds.menuItem("Project Manager",
+                      command=lambda *args: projectmanager.show(
+                        parent=self._parent))
+
+        cmds.menuItem("Reinstall Avalon",
+                      label="Reinstall Avalon",
                       subMenu=True,
-                      parent=self._menu)
+                      parent=system)
 
-        cmds.menuItem("Reload Pipeline", command=reload_pipeline)
+        cmds.menuItem("Confirm", command=reload_pipeline)
 
-        cmds.setParent("..", menu=True)
+        cmds.setParent(self._menu, menu=True)
 
         cmds.menuItem("Reset Frame Range",
                       command=interactive.reset_frame_range)
@@ -191,7 +185,11 @@ def _install_menu():
                       command=interactive.reset_resolution)
 
     # Allow time for uninstallation to finish.
-    QtCore.QTimer.singleShot(100, deferred)
+    # We use Maya's executeDeferred instead of QTimer.singleShot
+    # so that it only gets called after Maya UI has initialized too.
+    # This is crucial with Maya 2020+ which initializes without UI
+    # first as a QCoreApplication
+    maya.utils.executeDeferred(deferred)
 
 
 def launch_workfiles_app(*args):
@@ -199,7 +197,8 @@ def launch_workfiles_app(*args):
         os.path.join(
             cmds.workspace(query=True, rootDirectory=True),
             cmds.workspace(fileRuleEntry="scene")
-        )
+        ),
+        parent=self._parent
     )
 
 
@@ -210,8 +209,6 @@ def reload_pipeline(*args):
 
     """
 
-    import importlib
-
     api.uninstall()
 
     for module in ("avalon.io",
@@ -221,19 +218,17 @@ def reload_pipeline(*args):
                    "avalon.maya.interactive",
                    "avalon.maya.pipeline",
                    "avalon.maya.lib",
-                   "avalon.tools.loader.app",
                    "avalon.tools.creator.app",
-                   "avalon.tools.manager.app",
 
                    # NOTE(marcus): These have circular depenendencies
                    #               that is preventing reloadability
-                   # "avalon.tools.cbloader.delegates",
-                   # "avalon.tools.cbloader.model",
-                   # "avalon.tools.cbloader.widgets",
-                   # "avalon.tools.cbloader.app",
-                   # "avalon.tools.cbsceneinventory.model",
-                   # "avalon.tools.cbsceneinventory.proxy",
-                   # "avalon.tools.cbsceneinventory.app",
+                   # "avalon.tools.loader.delegates",
+                   # "avalon.tools.loader.model",
+                   # "avalon.tools.loader.widgets",
+                   # "avalon.tools.loader.app",
+                   # "avalon.tools.sceneinventory.model",
+                   # "avalon.tools.sceneinventory.proxy",
+                   # "avalon.tools.sceneinventory.app",
                    # "avalon.tools.projectmanager.dialogs",
                    # "avalon.tools.projectmanager.lib",
                    # "avalon.tools.projectmanager.model",
@@ -247,18 +242,21 @@ def reload_pipeline(*args):
         module = importlib.import_module(module)
         reload(module)
 
-    self._parent = {
-        widget.objectName(): widget
-        for widget in QtWidgets.QApplication.topLevelWidgets()
-    }["MayaWindow"]
+    get_main_window()
 
     import avalon.maya
     api.install(avalon.maya)
 
 
 def _uninstall_menu():
-    app = QtWidgets.QApplication.instance()
-    widgets = dict((w.objectName(), w) for w in app.allWidgets())
+
+    # In Maya 2020+ don't use the QApplication.instance()
+    # during startup (userSetup.py) as it will return a
+    # QtCore.QCoreApplication instance which does not have
+    # the allWidgets method. As such, we call the staticmethod.
+    all_widgets = QtWidgets.QApplication.allWidgets()
+
+    widgets = dict((w.objectName(), w) for w in all_widgets)
     menu = widgets.get(self._menu)
 
     if menu:
@@ -421,7 +419,7 @@ def containerise(name,
     return container
 
 
-def parse_container(container, validate=True):
+def parse_container(container):
     """Return the container node's full container data.
 
     Args:
@@ -439,34 +437,65 @@ def parse_container(container, validate=True):
     # Append transient data
     data["objectName"] = container
 
-    if validate:
-        schema.validate(data)
-
     return data
 
 
 def _ls():
-    containers = list()
-    for identifier in (AVALON_CONTAINER_ID,
-                       "pyblish.mindbender.container"):
-        containers += lib.lsattr("id", identifier)
+    """Yields Avalon container node names.
 
-    return containers
+    Used by `ls()` to retrieve the nodes and then query the full container's
+    data.
+
+    Yields:
+        str: Avalon container node name (objectSet)
+
+    """
+
+    def _maya_iterate(iterator):
+        """Helper to iterate a maya iterator"""
+        while not iterator.isDone():
+            yield iterator.thisNode()
+            iterator.next()
+
+    ids = {AVALON_CONTAINER_ID,
+           # Backwards compatibility
+           "pyblish.mindbender.container"}
+
+    # Iterate over all 'set' nodes in the scene to detect whether
+    # they have the avalon container ".id" attribute.
+    fn_dep = om.MFnDependencyNode()
+    iterator = om.MItDependencyNodes(om.MFn.kSet)
+    for mobject in _maya_iterate(iterator):
+        if mobject.apiTypeStr != "kSet":
+            # Only match by exact type
+            continue
+
+        fn_dep.setObject(mobject)
+        if not fn_dep.hasAttribute("id"):
+            continue
+
+        plug = fn_dep.findPlug("id", True)
+        value = plug.asString()
+        if value in ids:
+            yield fn_dep.name()
 
 
 def ls():
-    """List containers from active Maya scene
+    """Yields containers from active Maya scene
 
     This is the host-equivalent of api.ls(), but instead of listing
     assets on disk, it lists assets already loaded in Maya; once loaded
     they are called 'containers'
 
+    Yields:
+        dict: container
+
     """
     container_names = _ls()
 
     has_metadata_collector = False
-    config = find_host_config(api.registered_config())
-    if hasattr(config, "collect_container_metadata"):
+    config_host = find_submodule(api.registered_config(), "maya")
+    if hasattr(config_host, "collect_container_metadata"):
         has_metadata_collector = True
 
     for container in sorted(container_names):
@@ -474,7 +503,7 @@ def ls():
 
         # Collect custom data if attribute is present
         if has_metadata_collector:
-            metadata = config.collect_container_metadata(container)
+            metadata = config_host.collect_container_metadata(container)
             data.update(metadata)
 
         yield data
@@ -591,10 +620,7 @@ def _on_maya_initialized(*args):
         return
 
     # Keep reference to the main Window, once a main window exists.
-    self._parent = {
-        widget.objectName(): widget
-        for widget in QtWidgets.QApplication.topLevelWidgets()
-    }["MayaWindow"]
+    get_main_window()
 
 
 def _on_scene_new(*args):
